@@ -1,0 +1,16 @@
+            ERP2040
+             _____
+         |--| USB |--|
+    VBUS |           | RST
+     3V3 |           | GND
+     GP0 |           | GP8
+     GP1 |           | GP9
+     GP2 |           | GP10
+     GP3 |           | GP11
+     GP4 |           | GP12
+     GP5 |           | GP13
+     GP6 |           | GP14
+     GP7 |           | GP15
+      A1 |           | A0
+     GND |           | GND
+         |-----------|
