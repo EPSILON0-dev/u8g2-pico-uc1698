@@ -1,20 +1,54 @@
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
-#include "U8g2lib.h"
 #include "u8g2_port.hpp"
-#include <stdio.h> // TODO: Delete
 
-#define I2C_INTERFACE i2c0
-#define SDA_PIN 0
-#define SCL_PIN 1
+#define SDA_PIN 2
+#define SCK_PIN 3
+#define CD_PIN 4
+#define CS_PIN 5
+#define RESET_PIN 6
+
 
 // ---------------------------------------------------------------------------------
-// CALLBACKS (External file)
+// CALLBACKS
+
+// Due to my stupidity this has to be done in software
+static void spiSend(uint8_t data)
+{
+    // Just look at these 32 nops, truly marvelous
+    for (uint8_t i = 0; i < 8; i++) {
+        gpio_put(SDA_PIN, (data >> (7-i)) & 1);
+        gpio_put(SCK_PIN, 0);
+        __asm volatile ("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+        __asm volatile ("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+        gpio_put(SCK_PIN, 1);
+        __asm volatile ("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+        __asm volatile ("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+    }
+}
 
 uint8_t u8x8_gpio_delay_callback(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
 {
     switch(msg)
     {
+        case U8X8_MSG_GPIO_AND_DELAY_INIT:	// called once during init phase of u8g2/u8x8
+        gpio_init(SDA_PIN);
+        gpio_set_dir(SDA_PIN, GPIO_OUT);
+        gpio_put(SDA_PIN, 1);
+        gpio_init(SCK_PIN);
+        gpio_set_dir(SCK_PIN, GPIO_OUT);
+        gpio_put(SCK_PIN, 1);
+        gpio_init(CS_PIN);
+        gpio_set_dir(CS_PIN, GPIO_OUT);
+        gpio_put(CS_PIN, 1);
+        gpio_init(CD_PIN);
+        gpio_set_dir(CD_PIN, GPIO_OUT);
+        gpio_put(CS_PIN, 1);
+        gpio_init(RESET_PIN);
+        gpio_set_dir(RESET_PIN, GPIO_OUT);
+        gpio_put(RESET_PIN, 1);
+        break;
+
         case U8X8_MSG_DELAY_NANO:  // delay arg_int * 1 nano second
         break;    
 
@@ -30,6 +64,18 @@ uint8_t u8x8_gpio_delay_callback(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, voi
         sleep_ms(arg_int);
         break;
 
+        case U8X8_MSG_GPIO_CS:  // CS (chip select) pin: Output level in arg_int
+        gpio_put(CS_PIN, arg_int);
+        break;
+
+        case U8X8_MSG_GPIO_DC:  // DC (data/cmd, A0, register select) pin: Output level in arg_int
+        gpio_put(CD_PIN, arg_int);
+        break;
+
+        case U8X8_MSG_GPIO_RESET:  // Reset pin: Output level in arg_int
+        gpio_put(RESET_PIN, arg_int);
+        break;
+
         default:
         u8x8_SetGPIOResult(u8x8, 1);  // default return value
         break;
@@ -38,42 +84,171 @@ uint8_t u8x8_gpio_delay_callback(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, voi
     return 1;
 }
 
-uint8_t u8x8_i2c_callback(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
+uint8_t u8x8_spi_callback(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) 
 {
-    static uint8_t buffer[32];
-    static uint8_t index;
-    uint8_t *data = (uint8_t*)arg_ptr;
+    uint8_t *data;
+    uint8_t internal_spi_mode; 
 
-    switch(msg)
-    {
+    switch(msg) {
+
+        case U8X8_MSG_BYTE_SEND:
+        data = (uint8_t*)arg_ptr;
+        while (arg_int > 0) {
+            // TODO: Use the hardware SPI once the new board is made :/
+            spiSend((uint8_t)*data); // It's the one above
+            data++;
+            arg_int--;
+        }  
+        break;
+
         case U8X8_MSG_BYTE_INIT:
-        i2c_init(I2C_INTERFACE, 400000);
-        gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
-        gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
-        gpio_pull_up(SDA_PIN);
-        gpio_pull_up(SCL_PIN);
+        u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_disable_level);
+        break;
+
+        case U8X8_MSG_BYTE_SET_DC:
+        u8x8_gpio_SetDC(u8x8, arg_int);
         break;
 
         case U8X8_MSG_BYTE_START_TRANSFER:
-        index = 0;
+        u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_enable_level);  
+        u8x8->gpio_and_delay_cb(u8x8, U8X8_MSG_DELAY_NANO, u8x8->display_info->post_chip_enable_wait_ns, NULL);
         break;
 
-        case U8X8_MSG_BYTE_SEND:
-        while (arg_int--)
-            buffer[index++] = *(data++);
+        case U8X8_MSG_BYTE_END_TRANSFER:      
+        u8x8->gpio_and_delay_cb(u8x8, U8X8_MSG_DELAY_NANO, u8x8->display_info->pre_chip_disable_wait_ns, NULL);
+        u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_disable_level);
         break;
 
-        case U8X8_MSG_BYTE_END_TRANSFER:
-        i2c_write_blocking(I2C_INTERFACE, 
-            u8x8_GetI2CAddress(u8x8) >> 1, buffer, index, false);
-        printf("Transmitted block: ");
-        for (int i = 0; i < index; i++)
-            printf("%02X ", buffer[i]);
-        printf("\n");
+        default:
+        return 0;
+    }  
+    return 1;
+}
+
+void u8g2_Setup_uc1698_240x64_f(u8g2_t *u8g2, const u8g2_cb_t *rotation, u8x8_msg_cb byte_cb, u8x8_msg_cb gpio_and_delay_cb)
+{
+    uint8_t tile_buf_height;
+    uint8_t *buf;
+    u8g2_SetupDisplay(u8g2, u8x8_d_pcd8544_84x48, u8x8_cad_001, byte_cb, gpio_and_delay_cb);
+    buf = u8g2_m_30_8_f(&tile_buf_height);
+    u8g2_SetupBuffer(u8g2, buf, tile_buf_height, u8g2_ll_hvline_vertical_top_lsb, rotation);
+}
+
+static const uint8_t u8x8_d_uc1698_240x64_init_seq[] = {
+    U8X8_START_TRANSFER(),
+    
+    U8X8_C(0x2B),  // Power control
+    U8X8_C(0x25),  // Temperature compensation
+    U8X8_C(0xAD),  // LCD Enable
+    U8X8_C(0xD8),  // Scan function
+    U8X8_C(0xD5),  // Color mode
+    U8X8_C(0xF8),  // Window program mode
+    U8X8_C(0x89),  // Address control
+    U8X8_C(0xC0),  // LCD mapping
+    U8X8_C(0x50),  // Scroll high
+    U8X8_C(0x40),  // Scroll low
+    U8X8_C(0x81),  // Set contrast
+    U8X8_C(0x60),  // Contrast value
+        
+    U8X8_END_TRANSFER(),             	/* disable chip */
+    U8X8_END()             			/* end of sequence */
+};
+
+static const uint8_t u8x8_d_uc1698_240x64_powersave0_seq[] = {
+    U8X8_START_TRANSFER(),
+    // TODO: Add powerup sequence
+    U8X8_END_TRANSFER(),
+    U8X8_END()
+};
+
+static const uint8_t u8x8_d_uc1698_240x64_powersave1_seq[] = {
+    U8X8_START_TRANSFER(),
+    // TODO: Add powerdown sequence
+    U8X8_END_TRANSFER(),
+    U8X8_END()
+};
+
+
+
+static const u8x8_display_info_t u8x8_uc1698_240x64_display_info =
+{
+    /* chip_enable_level = */ 0,
+    /* chip_disable_level = */ 1,
+    
+    /* post_chip_enable_wait_ns = */ 5,
+    /* pre_chip_disable_wait_ns = */ 5,
+    /* reset_pulse_width_ms = */ 10, 
+    /* post_reset_wait_ms = */ 50, 
+    /* sda_setup_time_ns = */ 12,  // Doesn't matter
+    /* sck_pulse_width_ns = */ 75,  // Doesn't matter
+    /* sck_clock_hz = */ 4000000UL,  // Doesn't matter
+    /* spi_mode = */ 0,  // Doesn't matter
+    /* i2c_bus_clock_100kHz = */ 4,  // Doesn't matter
+    /* data_setup_time_ns = */ 30,  // Doesn't matter
+    /* write_pulse_width_ns = */ 40,  // Doesn't matter
+    /* tile_width = */ 30,
+    /* tile_height = */ 8,
+    /* default_x_offset = */ 0,
+    /* flipmode_x_offset = */ 0,
+    /* pixel_width = */ 240,
+    /* pixel_height = */ 64
+};
+
+uint8_t u8x8_d_pcd8544_84x48(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
+{
+    uint8_t *ptr;
+    uint8_t r, y, d[3];
+    int8_t x;
+    switch(msg)
+    {
+        case U8X8_MSG_DISPLAY_SETUP_MEMORY:
+        u8x8_d_helper_display_setup_memory(u8x8, &u8x8_uc1698_240x64_display_info);
         break;
 
-        // This one is useless
-        case U8X8_MSG_BYTE_SET_DC:
+        case U8X8_MSG_DISPLAY_INIT:
+        u8x8_d_helper_display_init(u8x8);
+        u8x8_cad_SendSequence(u8x8, u8x8_d_uc1698_240x64_init_seq);
+        break;
+
+        case U8X8_MSG_DISPLAY_SET_POWER_SAVE:
+        if (arg_int == 0)
+            u8x8_cad_SendSequence(u8x8, u8x8_d_uc1698_240x64_powersave0_seq);
+        else
+            u8x8_cad_SendSequence(u8x8, u8x8_d_uc1698_240x64_powersave1_seq);
+        break;
+        
+        case U8X8_MSG_DISPLAY_SET_CONTRAST:
+        u8x8_cad_StartTransfer(u8x8);
+        u8x8_cad_SendCmd(u8x8, 0x81);
+        u8x8_cad_SendCmd(u8x8, arg_int);
+        u8x8_cad_EndTransfer(u8x8);
+        break;
+
+        // The call format is known so we can do some trickery to make it work with our weird-ass
+        //  controller that takes 6 pixels every 3 transfers
+        case U8X8_MSG_DISPLAY_DRAW_TILE:
+        u8x8_cad_StartTransfer(u8x8);
+        ptr = ((u8x8_tile_t*)arg_ptr)->tile_ptr;
+
+        for (y = 0; y < 8; y++) {
+            r = ((u8x8_tile_t*)arg_ptr)->y_pos << 3 | y;
+            u8x8_cad_SendCmd(u8x8, 0x10);  // X = 0
+            u8x8_cad_SendCmd(u8x8, 0x00);
+            u8x8_cad_SendCmd(u8x8, 0x70 | (r >> 4));  // Y = tile * 8 + r
+            u8x8_cad_SendCmd(u8x8, 0x60 | (r & 0xf));
+            
+            for (x = 39; x >= 0; x--) {
+                d[0] = ((ptr[x * 6 + 3] >> y) & 1) * 240 |
+                    ((ptr[x * 6 + 4] >> y) & 1) * 15;
+                d[1] = ((ptr[x * 6 + 5] >> y) & 1) * 240 |
+                    ((ptr[x * 6 + 0] >> y) & 1) * 15;
+                d[2] = ((ptr[x * 6 + 1] >> y) & 1) * 240 |
+                    ((ptr[x * 6 + 2] >> y) & 1) * 15;
+                u8x8_cad_SendData(u8x8, 3, d);
+            }
+        }
+
+        u8x8_cad_EndTransfer(u8x8);
         break;
 
         default:
@@ -82,372 +257,4 @@ uint8_t u8x8_i2c_callback(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_
     return 1;
 }
 
-// Coppied stuff
 
-/* more or less generic setup of all these small OLEDs */
-static const uint8_t u8x8_d_custom_init_seq[] = {
-    
-  U8X8_START_TRANSFER(),             	/* enable chip, delay is part of the transfer start */
-  
-  
-  U8X8_C(0x0ae),		                /* display off */
-  U8X8_CA(0x0d5, 0x080),		/* clock divide ratio (0x00=1) and oscillator frequency (0x8) */
-  U8X8_CA(0x0a8, 0x03f),		/* multiplex ratio */
-  U8X8_CA(0x0d3, 0x000),		/* display offset */
-  U8X8_C(0x040),		                /* set display start line to 0 */
-  U8X8_CA(0x08d, 0x014),		/* [2] charge pump setting (p62): 0x014 enable, 0x010 disable, SSD1306 only, should be removed for SH1106 */
-  U8X8_CA(0x020, 0x000),		/* horizontal addressing mode */
-  
-  U8X8_C(0x0a1),				/* segment remap a0/a1*/
-  U8X8_C(0x0c8),				/* c0: scan dir normal, c8: reverse */
-  // Flipmode
-  // U8X8_C(0x0a0),				/* segment remap a0/a1*/
-  // U8X8_C(0x0c0),				/* c0: scan dir normal, c8: reverse */
-  
-  U8X8_CA(0x0da, 0x012),		/* com pin HW config, sequential com pin config (bit 4), disable left/right remap (bit 5) */
-
-  U8X8_CA(0x081, 0x0cf), 		/* [2] set contrast control */
-  U8X8_CA(0x0d9, 0x0f1), 		/* [2] pre-charge period 0x022/f1*/
-  U8X8_CA(0x0db, 0x040), 		/* vcomh deselect level */  
-  // if vcomh is 0, then this will give the biggest range for contrast control issue #98
-  // restored the old values for the noname constructor, because vcomh=0 will not work for all OLEDs, #116
-  
-  U8X8_C(0x02e),				/* Deactivate scroll */ 
-  U8X8_C(0x0a4),				/* output ram to display */
-  U8X8_C(0x0a6),				/* none inverted normal display mode */
-    
-  U8X8_END_TRANSFER(),             	/* disable chip */
-  U8X8_END()             			/* end of sequence */
-};
-
-static const uint8_t u8x8_d_ssd1306_128x64_noname_powersave0_seq[] = {
-  U8X8_START_TRANSFER(),             	/* enable chip, delay is part of the transfer start */
-  U8X8_C(0x0af),		                /* display on */
-  U8X8_END_TRANSFER(),             	/* disable chip */
-  U8X8_END()             			/* end of sequence */
-};
-
-static const uint8_t u8x8_d_ssd1306_128x64_noname_powersave1_seq[] = {
-  U8X8_START_TRANSFER(),             	/* enable chip, delay is part of the transfer start */
-  U8X8_C(0x0ae),		                /* display off */
-  U8X8_END_TRANSFER(),             	/* disable chip */
-  U8X8_END()             			/* end of sequence */
-};
-
-static const uint8_t u8x8_d_ssd1306_128x64_noname_flip0_seq[] = {
-  U8X8_START_TRANSFER(),             	/* enable chip, delay is part of the transfer start */
-  U8X8_C(0x0a1),				/* segment remap a0/a1*/
-  U8X8_C(0x0c8),				/* c0: scan dir normal, c8: reverse */
-  U8X8_END_TRANSFER(),             	/* disable chip */
-  U8X8_END()             			/* end of sequence */
-};
-
-static const uint8_t u8x8_d_ssd1306_128x64_noname_flip1_seq[] = {
-  U8X8_START_TRANSFER(),             	/* enable chip, delay is part of the transfer start */
-  U8X8_C(0x0a0),				/* segment remap a0/a1*/
-  U8X8_C(0x0c0),				/* c0: scan dir normal, c8: reverse */
-  U8X8_END_TRANSFER(),             	/* disable chip */
-  U8X8_END()             			/* end of sequence */
-};
-
-static uint8_t u8x8_d_ssd1306_sh1106_generic(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-  uint8_t x, c;
-  uint8_t *ptr;
-  switch(msg)
-  {
-    /* handled by the calling function
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_ssd1306_128x64_noname_display_info);
-      break;
-    */
-    /* handled by the calling function
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_init_seq);    
-      break;
-    */
-    case U8X8_MSG_DISPLAY_SET_POWER_SAVE:
-      if ( arg_int == 0 )
-	u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_powersave0_seq);
-      else
-	u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_powersave1_seq);
-      break;
-    case U8X8_MSG_DISPLAY_SET_FLIP_MODE:
-      if ( arg_int == 0 )
-      {
-	u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_flip0_seq);
-	u8x8->x_offset = u8x8->display_info->default_x_offset;
-      }
-      else
-      {
-	u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_flip1_seq);
-	u8x8->x_offset = u8x8->display_info->flipmode_x_offset;
-      }
-      break;
-#ifdef U8X8_WITH_SET_CONTRAST
-    case U8X8_MSG_DISPLAY_SET_CONTRAST:
-      u8x8_cad_StartTransfer(u8x8);
-      u8x8_cad_SendCmd(u8x8, 0x081 );
-      u8x8_cad_SendArg(u8x8, arg_int );	/* ssd1306 has range from 0 to 255 */
-      u8x8_cad_EndTransfer(u8x8);
-      break;
-#endif
-    case U8X8_MSG_DISPLAY_DRAW_TILE:
-      u8x8_cad_StartTransfer(u8x8);
-      x = ((u8x8_tile_t *)arg_ptr)->x_pos;    
-      x *= 8;
-      x += u8x8->x_offset;
-    
-      u8x8_cad_SendCmd(u8x8, 0x040 );	/* set line offset to 0 */
-    
-      u8x8_cad_SendCmd(u8x8, 0x010 | (x>>4) );
-      u8x8_cad_SendArg(u8x8, 0x000 | ((x&15)));					/* probably wrong, should be SendCmd */
-      u8x8_cad_SendArg(u8x8, 0x0b0 | (((u8x8_tile_t *)arg_ptr)->y_pos));	/* probably wrong, should be SendCmd */
-
-    
-      do
-      {
-	c = ((u8x8_tile_t *)arg_ptr)->cnt;
-	ptr = ((u8x8_tile_t *)arg_ptr)->tile_ptr;
-	u8x8_cad_SendData(u8x8, c*8, ptr); 	/* note: SendData can not handle more than 255 bytes */
-	/*
-	do
-	{
-	  u8x8_cad_SendData(u8x8, 8, ptr);
-	  ptr += 8;
-	  c--;
-	} while( c > 0 );
-	*/
-	arg_int--;
-      } while( arg_int > 0 );
-      
-      u8x8_cad_EndTransfer(u8x8);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-}
-
-
-static const u8x8_display_info_t u8x8_ssd1306_128x64_noname_display_info =
-{
-  /* chip_enable_level = */ 0,
-  /* chip_disable_level = */ 1,
-  
-  /* post_chip_enable_wait_ns = */ 20,
-  /* pre_chip_disable_wait_ns = */ 10,
-  /* reset_pulse_width_ms = */ 100, 	/* SSD1306: 3 us */
-  /* post_reset_wait_ms = */ 100, /* far east OLEDs need much longer setup time */
-  /* sda_setup_time_ns = */ 50,		/* SSD1306: 15ns, but cycle time is 100ns, so use 100/2 */
-  /* sck_pulse_width_ns = */ 50,	/* SSD1306: 20ns, but cycle time is 100ns, so use 100/2, AVR: below 70: 8 MHz, >= 70 --> 4MHz clock */
-  /* sck_clock_hz = */ 8000000UL,	/* since Arduino 1.6.0, the SPI bus speed in Hz. Should be  1000000000/sck_pulse_width_ns */
-  /* spi_mode = */ 0,		/* active high, rising edge */
-  /* i2c_bus_clock_100kHz = */ 4,
-  /* data_setup_time_ns = */ 40,
-  /* write_pulse_width_ns = */ 150,	/* SSD1306: cycle time is 300ns, so use 300/2 = 150 */
-  /* tile_width = */ 16,
-  /* tile_height = */ 8,
-  /* default_x_offset = */ 0,
-  /* flipmode_x_offset = */ 0,
-  /* pixel_width = */ 128,
-  /* pixel_height = */ 64
-};
-
-uint8_t u8x8_d_ssd1306_128x64_noname(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-    
-  if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-    return 1;
-  
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_init_seq);    
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_ssd1306_128x64_noname_display_info);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-}
-
-uint8_t u8x8_d_ssd1312_128x64_noname(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_SET_FLIP_MODE:
-      if ( arg_int == 0 )
-      {
-	u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1312_128x64_noname_flip0_seq);
-	u8x8->x_offset = u8x8->display_info->default_x_offset;
-      }
-      else
-      {
-	u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1312_128x64_noname_flip1_seq);
-	u8x8->x_offset = u8x8->display_info->flipmode_x_offset;
-      }
-      break;
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1312_128x64_noname_init_seq);    /* update 27 mar 2022 */
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_ssd1306_128x64_noname_display_info);
-      break;
-    default:
-      if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-        return 1;
-  }
-  return 1;
-}
-
-
-
-uint8_t u8x8_d_ssd1306_128x64_vcomh0(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-    
-  if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-    return 1;
-  
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_vcomh0_init_seq);    
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_ssd1306_128x64_noname_display_info);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-}
-
-uint8_t u8x8_d_ssd1306_128x64_alt0(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-  
-  if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-    return 1;
-  
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_alt0_init_seq);    
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_ssd1306_128x64_noname_display_info);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-}
-
-
-static const u8x8_display_info_t u8x8_sh1106_128x64_noname_display_info =
-{
-  /* chip_enable_level = */ 0,
-  /* chip_disable_level = */ 1,
-  
-  /* post_chip_enable_wait_ns = */ 20,
-  /* pre_chip_disable_wait_ns = */ 10,
-  /* reset_pulse_width_ms = */ 100, 	/* SSD1306: 3 us */
-  /* post_reset_wait_ms = */ 100, /* far east OLEDs need much longer setup time */
-  /* sda_setup_time_ns = */ 50,		/* SSD1306: 15ns, but cycle time is 100ns, so use 100/2 */
-  /* sck_pulse_width_ns = */ 50,	/* SSD1306: 20ns, but cycle time is 100ns, so use 100/2, AVR: below 70: 8 MHz, >= 70 --> 4MHz clock */
-  /* sck_clock_hz = */ 4000000UL,	/* since Arduino 1.6.0, the SPI bus speed in Hz. Should be  1000000000/sck_pulse_width_ns, increased to 8MHz (issue 215) */
-  /* spi_mode = */ 0,		/* issue 1901: changed mode from 3 to 0 */
-  /* i2c_bus_clock_100kHz = */ 4,
-  /* data_setup_time_ns = */ 40,
-  /* write_pulse_width_ns = */ 150,	/* SSD1306: cycle time is 300ns, so use 300/2 = 150 */
-  /* tile_width = */ 16,
-  /* tile_height = */ 8,
-  /* default_x_offset = */ 2,
-  /* flipmode_x_offset = */ 2,
-  /* pixel_width = */ 128,
-  /* pixel_height = */ 64
-};
-
-uint8_t u8x8_d_sh1106_128x64_noname(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-  if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-    return 1;
-  
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      /* maybe use a better init sequence */
-      /* https://www.mikrocontroller.net/topic/431371 */
-      /* the new sequence is added in the winstar constructor (see below), this is kept untouched */
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_noname_init_seq);    
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_sh1106_128x64_noname_display_info);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-    
-}
-
-uint8_t u8x8_d_sh1106_128x64_vcomh0(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-  if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-    return 1;
-  
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_ssd1306_128x64_vcomh0_init_seq);    
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_sh1106_128x64_noname_display_info);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-    
-}
-
-uint8_t u8x8_d_sh1106_128x64_winstar(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
-{
-  if ( u8x8_d_ssd1306_sh1106_generic(u8x8, msg, arg_int, arg_ptr) != 0 )
-    return 1;
-  
-  switch(msg)
-  {
-    case U8X8_MSG_DISPLAY_INIT:
-      u8x8_d_helper_display_init(u8x8);
-      u8x8_cad_SendSequence(u8x8, u8x8_d_sh1106_128x64_winstar_init_seq);    
-      break;
-    case U8X8_MSG_DISPLAY_SETUP_MEMORY:
-      u8x8_d_helper_display_setup_memory(u8x8, &u8x8_sh1106_128x64_noname_display_info);
-      break;
-    default:
-      return 0;
-  }
-  return 1;
-    
-}
-
-
-/* ssd1306 f */
-void u8g2_Setup_custom(u8g2_t *u8g2, const u8g2_cb_t *rotation, u8x8_msg_cb byte_cb, u8x8_msg_cb gpio_and_delay_cb)
-{
-  uint8_t tile_buf_height;
-  uint8_t *buf;
-  u8g2_SetupDisplay(u8g2, u8x8_d_ssd1306_128x64_noname, u8x8_cad_ssd13xx_fast_i2c, byte_cb, gpio_and_delay_cb);
-  buf = u8g2_m_16_8_f(&tile_buf_height);
-  u8g2_SetupBuffer(u8g2, buf, tile_buf_height, u8g2_ll_hvline_vertical_top_lsb, rotation);
-}
