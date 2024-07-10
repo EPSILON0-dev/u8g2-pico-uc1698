@@ -156,14 +156,14 @@ static const uint8_t u8x8_d_uc1698_240x64_init_seq[] = {
 
 static const uint8_t u8x8_d_uc1698_240x64_powersave0_seq[] = {
     U8X8_START_TRANSFER(),
-    // TODO: Add powerup sequence
+    U8X8_C(0xAD),  // LCD Enable
     U8X8_END_TRANSFER(),
     U8X8_END()
 };
 
 static const uint8_t u8x8_d_uc1698_240x64_powersave1_seq[] = {
     U8X8_START_TRANSFER(),
-    // TODO: Add powerdown sequence
+    U8X8_C(0xA8),  // LCD Disable
     U8X8_END_TRANSFER(),
     U8X8_END()
 };

@@ -24,7 +24,10 @@ int main() {
 
     u8g2.setContrast(105);
 
+    bool ps = 0;
     while (1) {   
-        sleep_ms(100);
+        u8g2.setPowerSave(ps);
+        ps ^= 1;
+        sleep_ms(2000);
     }
 }
